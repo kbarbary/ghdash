@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Beetle: Fetch some events from github and put them on a page."""
+"""Fetch some events from github and put them on a page."""
 
 from __future__ import print_function, division
 
@@ -256,15 +256,15 @@ def timeago(event):
 # (1) a dictionary with "icon" and "body" keys
 # (2) `None` if the event is not of interest
 
-def gh(s):
+def ghlink(s):
     """Return an HTML <a> tag with a link to github"""
 
     return '<a href="https://github.com/{s}">{s}</a>'.format(s=s)
 
 
 def simplebody(event, action):
-    return '{} {} {}'.format(gh(event["actor"]["login"]), action,
-                             gh(event["repo"]["name"]))
+    return '{} {} {}'.format(ghlink(event["actor"]["login"]), action,
+                             ghlink(event["repo"]["name"]))
 
 
 def parse_watch(event):
@@ -298,8 +298,8 @@ def parse_pullrequest(event):
 
     if action == "opened" or action == "merged":
         body = ('{} {} pull request <a href="{}" title="{}">#{}</a> on {}'
-                .format(gh(login), action, pr_url, pr_title, number,
-                        gh(repo_name)))
+                .format(ghlink(login), action, pr_url, pr_title, number,
+                        ghlink(repo_name)))
         return {"icon": "git-pull-request",
                 "body": body}
     else:
@@ -316,10 +316,11 @@ def parse_create(event):
 
     if ref_type == "repository":
         icon = "repo"
-        body = "{} created {}".format(gh(login), gh(repo_name))
-    if ref_type == "tag":
+        body = "{} created {}".format(ghlink(login), ghlink(repo_name))
+    elif ref_type == "tag":
         icon = "tag"
-        body = "{} tagged {} on {}".format(gh(login), ref, gh(repo_name))
+        body = "{} tagged {} on {}".format(ghlink(login), ref,
+                                           ghlink(repo_name))
     else:
         return None
 
@@ -331,7 +332,8 @@ def parse_release(event):
     repo_name = event["repo"]["name"]
     tag_name = event["payload"]["release"]["tag_name"]
 
-    body = "{} released {} of {}".format(gh(login), tag_name, gh(repo_name))
+    body = "{} released {} of {}".format(ghlink(login), tag_name,
+                                         ghlink(repo_name))
 
     return {"icon": "package", "body": body}
 
@@ -344,7 +346,7 @@ def parse_push(event):
     msg = "\n".join([c["message"].split("\n")[0] for c in commits])
 
     body = '{} pushed <a title="{}">{} commits</a> to {}'.format(
-        gh(login), msg, ncommits, gh(repo_name))
+        ghlink(login), msg, ncommits, ghlink(repo_name))
 
     return {"icon": "git-commit", "body": body}
 
