@@ -1,0 +1,455 @@
+#!/usr/bin/env python
+"""Beetle: Fetch some events from github and put them on a page."""
+
+from __future__ import print_function, division
+
+import sys
+import os
+import json
+import shutil
+from datetime import datetime
+
+import requests
+from jinja2 import Template
+
+from pprint import pprint  # development only
+
+TMPL_DIR = "tmpl"
+OUTPUT_DIR = "output"
+USERS_FILE = "users.txt"
+DATA_DIR = "data"
+GH_USER_EVENTS_URL = "https://api.github.com/users/{}/events/public"
+
+
+def info(msg):
+    """Print a line in blue (assumes we have a color terminal!)"""
+    print("\033[1m\033[34m", "INFO:", msg, "\033[0m")
+
+
+def read_users(fname):
+    """Read a file and split into lines, stripping comments starting with 
+    a hash (#) and blank lines."""
+    users = []
+    with open(fname, "r") as f:
+        for line in f.readlines():
+            pos = line.find("#")
+            if pos != -1:
+                line = line[0:pos]
+            line = line.strip(" \n")
+            if len(line) > 0:
+                users.append(line)
+
+    return users
+
+
+def fetch_user_events(user):
+    """Fetch public github events for the given user."""
+
+    dirname = os.path.join(DATA_DIR, "users", user)
+    poll_fname = os.path.join(dirname, "poll-info")
+    url = GH_USER_EVENTS_URL.format(user)
+
+    # ensure user directory exists
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+    # Get a list of all user events already recorded and special data we saved
+    # about the last time we polled github.
+    fnames = os.listdir(dirname)
+    if "poll-info" in fnames:
+        with open(poll_fname, "r") as f:
+            lines = [line.strip() for line in f]
+            etag, poll_time, poll_interval = lines
+        fnames.remove("poll-info")
+    else:
+        etag, poll_time, poll_interval = None, None, None
+
+    # TODO: check poll time and poll interval
+
+    headers = {"If-None-Match": etag} if (etag is not None) else None
+    r = requests.get(url, headers=headers)
+
+    if r.status_code == 304:
+        msg = user + ": up-to-date"
+        # TODO: update poll time
+
+    elif r.status_code == 200:
+        events = r.json()
+
+        # write each new event to a separate file
+        new = 0
+        for event in events:
+            id = event["id"]
+            if id not in fnames:
+                fname = os.path.join(dirname, id)
+                with open(fname, "w") as f:
+                    json.dump(event, f)
+                new += 1
+        msg = "{}: {} new event".format(user, new)
+        if new > 1:
+            msg += "s"
+
+        # write the polling metadata
+        etag = r.headers["etag"]
+        interval = r.headers["x-poll-interval"]
+        with open(poll_fname, "w") as f:
+            f.write(etag)
+            f.write("\n")
+            f.write(datetime.now().isoformat())
+            f.write("\n")
+            f.write(str(interval))
+
+    else:
+        raise Exception("request to {} failed with status {}"
+                        .format(url, r.status_code))
+
+    # append rate limit info
+    limit = r.headers['x-ratelimit-limit']
+    remaining = r.headers['x-ratelimit-remaining']
+    info("{:30s} [{:>4s}/{:>4s}]".format(msg, remaining, limit))
+
+def read_user_events(user):
+    """Read user events from json data already in the cache"""
+
+    dirname = os.path.join(DATA_DIR, "users", user)
+    fnames = os.listdir(dirname)
+    if "poll-info" in fnames:
+        fnames.remove("poll-info")
+
+    events = []
+    for fname in fnames:
+        with open(os.path.join(dirname, fname)) as f:
+            events.append(json.load(f))
+
+    return events
+
+
+def is_not_merge(event):
+    if event["type"] != "PushEvent":
+        return True
+    lastmsg = event["payload"]["commits"][-1]["message"]
+    if lastmsg.lower().startswith("merge pull request"):
+        return False
+    else:
+        return True
+
+
+def filter_merges_in_user_events(events):
+    return list(filter(is_not_merge, events))
+
+
+def combine_push_events(events):
+    """Aggregate a set of push events into a single AggPushEvent."""
+
+    if len(events) == 1:
+        return events[0]
+
+    # get all commit messages
+    commits = []
+    for e in events:
+        commits.extend(e["payload"]["commits"])
+
+    # get total size
+    distinct_size = sum([e["payload"]["distinct_size"] for e in events])
+
+    # assumes that list is already sorted by time
+    d = {"type": "AggPushEvent",
+         "actor": events[0]["actor"],
+         "repo": events[0]["repo"],
+         "payload": {"commits": commits,
+                     "distinct_size": distinct_size},
+         "created_at": events[0]["created_at"],  # most recent
+         "begin": events[0]["created_at"],  # most recent
+         "end": events[-1]["created_at"]}  # least recent
+
+    return d
+
+
+def aggregate_pushes_in_user_events(events):
+    """Aggregate all the pushes a set of events from a single user.
+
+    Specifically, we remove PushEvents that are merging a PR and 
+    we aggregate nearby PushEvents into a single AggPushEvent.
+    """
+
+    # sort events by time
+    events.sort(key=lambda x: x["created_at"], reverse=True)
+
+    # split into repos
+    names = set([e["repo"]["name"] for e in events])
+    events_by_repo = {n: [] for n in names}
+    for e in events:
+        events_by_repo[e["repo"]["name"]].append(e)
+
+    new_events = []
+    for name in events_by_repo:
+        aggevents = None
+        t1 = None
+        for event in events_by_repo[name]:
+            if event["type"] != "PushEvent":
+                new_events.append(event)
+                continue
+
+            if aggevents is None:
+                aggevents = [event]
+                t1 = datetime.strptime(event["created_at"],
+                                       "%Y-%m-%dT%H:%M:%SZ")
+            else:
+                t2 = datetime.strptime(event["created_at"],
+                                       "%Y-%m-%dT%H:%M:%SZ")
+                dt = t1 - t2
+                if dt.days < 1:
+                    aggevents.append(event)
+                else:
+                    new_events.append(combine_push_events(aggevents))
+                    aggevents = [event]
+                    t1 = t2
+
+        # clean up remaining events
+        if aggevents is not None:
+            new_events.append(combine_push_events(aggevents))
+
+    return new_events
+
+
+def format_timedelta(td):
+    if td.days > 1:
+        return "{} days ago".format(td.days)
+    elif td.days == 1:
+        return "1 day ago"
+    elif td.seconds > 7200:
+        return "{} hours ago".format(td.seconds // 3600)
+    elif td.seconds > 3600:
+        return "1 hour ago"
+    elif td.seconds > 120:
+        return "{} minutes ago".format(td.seconds // 60)
+    elif td.seconds > 60:
+        return "1 minute ago"
+    else:
+        return "just now"
+
+
+def timeago1(time):
+    tnow = datetime.utcnow()
+    t = datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ")
+    td = tnow - t
+    return format_timedelta(td)
+
+
+def timeago(event):
+    if event["type"] == "AggPushEvent":
+        s1 = timeago1(event["begin"])
+        s2 = timeago1(event["end"])
+        if s1 == s2:
+            return s1
+        else:
+            return '{} &ndash; {}'.format(s1, s2)
+    else:
+        return timeago1(event["created_at"])
+
+# -----------------------------------------------------------------------------
+# Parsing events
+#
+# Different types of events have different payloads and thus will be parsed
+# differently. The global PARSERS variable maps event types (e.g., "PushEvent")
+# to parsing functions. Each parsing function should return either:
+# (1) a dictionary with "icon" and "body" keys
+# (2) `None` if the event is not of interest
+
+def gh(s):
+    """Return an HTML <a> tag with a link to github"""
+
+    return '<a href="https://github.com/{s}">{s}</a>'.format(s=s)
+
+
+def simplebody(event, action):
+    return '{} {} {}'.format(gh(event["actor"]["login"]), action,
+                             gh(event["repo"]["name"]))
+
+
+def parse_watch(event):
+    return {"icon": "star",
+            "body": simplebody(event, "starred")}
+
+
+def parse_fork(event):
+    return {"icon": "repo-forked",
+            "body": simplebody(event, "forked")}
+
+
+def parse_public(event):
+    return {"icon": "heart",
+            "body": simplebody(event, "open-sourced")}
+
+
+def parse_pullrequest(event):
+    """Only return new and merged pull requests"""
+
+    action = event["payload"]["action"]
+    login = event["actor"]["login"]
+    number = event["payload"]["number"]
+    pr_url = event["payload"]["pull_request"]["html_url"]
+    pr_title = event["payload"]["pull_request"]["title"]
+    repo_name = event["repo"]["name"]
+
+    # correct closed to merged.
+    if action == "closed" and event["payload"]["pull_request"]["merged"]:
+        action = "merged"
+
+    if action == "opened" or action == "merged":
+        body = ('{} {} pull request <a href="{}" title="{}">#{}</a> on {}'
+                .format(gh(login), action, pr_url, pr_title, number,
+                        gh(repo_name)))
+        return {"icon": "git-pull-request",
+                "body": body}
+    else:
+        return None
+
+
+def parse_create(event):
+    """Parse new repositories, new tags, but not branches"""
+
+    ref_type = event["payload"]["ref_type"]
+    login = event["actor"]["login"]
+    repo_name = event["repo"]["name"]
+    ref = event["payload"]["ref"]
+
+    if ref_type == "repository":
+        icon = "repo"
+        body = "{} created {}".format(gh(login), gh(repo_name))
+    if ref_type == "tag":
+        icon = "tag"
+        body = "{} tagged {} on {}".format(gh(login), ref, gh(repo_name))
+    else:
+        return None
+
+    return {"icon": icon, "body": body}
+
+
+def parse_release(event):
+    login = event["actor"]["login"]
+    repo_name = event["repo"]["name"]
+    tag_name = event["payload"]["release"]["tag_name"]
+
+    body = "{} released {} of {}".format(gh(login), tag_name, gh(repo_name))
+
+    return {"icon": "package", "body": body}
+
+
+def parse_push(event):
+    login = event["actor"]["login"]
+    repo_name = event["repo"]["name"]
+    commits = event["payload"]["commits"]
+    ncommits = event["payload"]["distinct_size"]
+    msg = "\n".join([c["message"].split("\n")[0] for c in commits])
+
+    body = '{} pushed <a title="{}">{} commits</a> to {}'.format(
+        gh(login), msg, ncommits, gh(repo_name))
+
+    return {"icon": "git-commit", "body": body}
+
+
+PARSERS = {"WatchEvent": parse_watch,  # stars a repo
+           "PullRequestEvent": parse_pullrequest,  # anything to do with a PR
+           "CreateEvent": parse_create,  # creates a repo, branch or tag
+           "ForkEvent": parse_fork,  # fork a repo
+           "PublicEvent": parse_public,  # open-source a repo
+           "ReleaseEvent": parse_release,  # draft a release
+           "PushEvent": parse_push,  # repo branch is pushed to
+           "AggPushEvent": parse_push}  # custom "event" type we create
+
+
+def parse(event):
+    """Parse an event into a dictionary or None.
+    
+    If the event is one we are interested in, return a dictionary with
+    "icon", "body", "time" keys.
+
+    If the event is one we are not interested in, return None.
+    """
+    t = event["type"]
+    if t not in PARSERS:
+        return None
+    d = PARSERS[t](event)
+    if d is None:
+        return None
+
+    # append timestamp & time string
+    d["time"] = event["created_at"]
+    d["timeago"] = timeago(event)
+
+    return d
+
+
+def build_html(events):
+    """Render events"""
+
+    #sort events by time
+    events.sort(key=lambda x: x["created_at"], reverse=True)
+
+    # Print all events, just for dev info.
+    #for event in events:
+    #    info(" ".join([event["created_at"],
+    #                   event["actor"]["login"],
+    #                   event["type"]]))
+
+    # parse all events
+    summaries = []
+    for event in events:
+        s = parse(event)
+        if s is not None:
+            summaries.append(s)
+
+    # load template
+    with open(os.path.join(TMPL_DIR, "index.html")) as f:
+        template_html = f.read()
+    template = Template(template_html)
+
+    # copy static files
+    for subdir in ["css", "style"]:
+        src = os.path.join(TMPL_DIR, subdir)
+        dst = os.path.join(OUTPUT_DIR, subdir)
+        if not os.path.exists(dst):
+            shutil.copytree(src, dst)
+
+    # render and ouput page.
+    page = template.render(events=summaries)
+    fname = os.path.join(OUTPUT_DIR, "index.html")
+    with open(fname, "w") as f:
+        f.write(page)
+    info("wrote " + fname)
+
+
+# -----------------------------------------------------------------------------
+# Main
+
+if __name__ == "__main__":
+    
+    usage = ("Usage: {} fetch\n"
+              "       {} build".format(__file__, __file__))
+
+    if len(sys.argv) != 2 or sys.argv[1] == "--help" or sys.argv[1] == "-h":
+        print(usage)
+        exit(1)
+
+    command = sys.argv[1]
+
+    users = read_users(USERS_FILE)
+
+    if command == "fetch":
+        for user in users:
+            fetch_user_events(user)
+
+    elif command == "build":
+        allevents = []
+        for user in users:
+            events = read_user_events(user)
+            events = filter_merges_in_user_events(events)
+            events = aggregate_pushes_in_user_events(events)
+            allevents.extend(events)
+
+        build_html(allevents)
+
+    else:
+        print(usage)
+        exit(1)

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="css/bootstrap.min.css">
+  <link rel="stylesheet" href="style/octicons.css">
+  <style>
+      .event {
+          border-top: 1px solid #f1f1f1;
+          padding: 10px;
+      }
+
+      .event .mega-octicon {
+      width: 32px;
+      color: #888;
+      }
+      .event time {
+      color: #888;
+      }
+
+      .event .lead {
+      margin: 0 5px;
+      }
+  </style>
+</head>
+
+<body>
+<div class="container">
+
+<h1>Events</h1>
+
+
+{% for event in events %}
+<div class="event"><span class="mega-octicon octicon-{{ event.icon }}"></span><span class="lead">{{ event.body }}</span> <time datetime="{{ event.time }}">{{ event.timeago }}</time></div>
+{% endfor %}
+</ul>
+
+</div>
+</body>
+</html>
