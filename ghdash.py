@@ -26,6 +26,15 @@ def info(msg):
     print("\033[1m\033[34m", "INFO:", msg, "\033[0m")
 
 
+def timeago(time):
+    """Given an ISO-8601 formatted timestamp (UTC), return time ago as a
+    timedelta object."""
+    tnow = datetime.utcnow()
+    t = datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ")
+
+    return tnow - t
+
+
 def read_users(fname):
     """Read a file and split into lines, stripping comments starting with 
     a hash (#) and blank lines."""
@@ -42,6 +51,27 @@ def read_users(fname):
     return users
 
 
+def write_poll_info(fname, etag, poll_interval):
+    """Write polling metadata to file `fname`."""
+
+    with open(fname, "w") as f:
+        f.write(etag)
+        f.write("\n")
+        f.write(datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+        f.write("\n")
+        f.write(str(poll_interval))
+
+
+def read_poll_info(fname):
+    """Return etag, poll_time (ISO 8601 formatted), poll_interval"""
+
+    with open(fname, "r") as f:
+        lines = [line.strip() for line in f]
+        etag, poll_time, poll_interval = lines
+
+    return etag, poll_time, int(poll_interval)
+
+
 def fetch_user_events(user):
     """Fetch public github events for the given user."""
 
@@ -53,25 +83,34 @@ def fetch_user_events(user):
     if not os.path.exists(dirname):
         os.makedirs(dirname)
 
-    # Get a list of all user events already recorded and special data we saved
+    # Get a list of events already locally cached and special data we saved
     # about the last time we polled github.
     fnames = os.listdir(dirname)
     if "poll-info" in fnames:
-        with open(poll_fname, "r") as f:
-            lines = [line.strip() for line in f]
-            etag, poll_time, poll_interval = lines
+        etag, poll_time, poll_interval = read_poll_info(poll_fname)
         fnames.remove("poll-info")
     else:
         etag, poll_time, poll_interval = None, None, None
 
-    # TODO: check poll time and poll interval
+    # Check if we already polled recently, respecting the poll interval.
+    if poll_time is not None and poll_interval is not None:
+        td = timeago(poll_time)
+        t_sec = td.days * 86400 + td.seconds
+        if t_sec < poll_interval:
+            info("{}: polled {}s ago. Next poll allowed in {}s."
+                 .format(user, t_sec, poll_interval - t_sec))
+            return
 
     headers = {"If-None-Match": etag} if (etag is not None) else None
     r = requests.get(url, headers=headers)
 
     if r.status_code == 304:
         msg = user + ": up-to-date"
-        # TODO: update poll time
+
+        # If we get this status code, it means that etag wasn't None
+        # and that means that poll_interval was also not None.
+        # update poll-info with the current time.
+        write_poll_info(poll_fname, etag, poll_interval)
 
     elif r.status_code == 200:
         events = r.json()
@@ -90,20 +129,14 @@ def fetch_user_events(user):
             msg += "s"
 
         # write the polling metadata
-        etag = r.headers["etag"]
-        interval = r.headers["x-poll-interval"]
-        with open(poll_fname, "w") as f:
-            f.write(etag)
-            f.write("\n")
-            f.write(datetime.now().isoformat())
-            f.write("\n")
-            f.write(str(interval))
+        write_poll_info(poll_fname, r.headers["etag"],
+                        r.headers["x-poll-interval"])
 
     else:
         raise Exception("request to {} failed with status {}"
                         .format(url, r.status_code))
 
-    # append rate limit info
+    # append rate limit info to message
     limit = r.headers['x-ratelimit-limit']
     remaining = r.headers['x-ratelimit-remaining']
     info("{:30s} [{:>4s}/{:>4s}]".format(msg, remaining, limit))
@@ -124,18 +157,17 @@ def read_user_events(user):
     return events
 
 
-def is_not_merge(event):
-    if event["type"] != "PushEvent":
-        return True
-    lastmsg = event["payload"]["commits"][-1]["message"]
-    if lastmsg.lower().startswith("merge pull request"):
-        return False
-    else:
-        return True
+def is_merge_event(event):
+    if event["type"] == "PushEvent":
+        lastmsg = event["payload"]["commits"][-1]["message"]
+        if lastmsg.lower().startswith("merge pull request"):
+            return True
+
+    return False
 
 
 def filter_merges_in_user_events(events):
-    return list(filter(is_not_merge, events))
+    return list(filter(lambda x: (not is_merge_event(x)), events))
 
 
 def combine_push_events(events):
@@ -166,10 +198,7 @@ def combine_push_events(events):
 
 
 def aggregate_pushes_in_user_events(events):
-    """Aggregate all the pushes a set of events from a single user.
-
-    Specifically, we remove PushEvents that are merging a PR and 
-    we aggregate nearby PushEvents into a single AggPushEvent.
+    """Aggregate nearby PushEvents in a single user's events.
     """
 
     # sort events by time
@@ -212,7 +241,7 @@ def aggregate_pushes_in_user_events(events):
     return new_events
 
 
-def format_timedelta(td):
+def fmt_timedelta(td):
     if td.days > 1:
         return "{} days ago".format(td.days)
     elif td.days == 1:
@@ -229,23 +258,25 @@ def format_timedelta(td):
         return "just now"
 
 
-def timeago1(time):
+def timeago(time):
+    """Given an ISO-8601 formatted timestamp, return time ago as a timedelta
+    object."""
     tnow = datetime.utcnow()
     t = datetime.strptime(time, "%Y-%m-%dT%H:%M:%SZ")
-    td = tnow - t
-    return format_timedelta(td)
+
+    return tnow - t
 
 
-def timeago(event):
+def timeago_event(event):
     if event["type"] == "AggPushEvent":
-        s1 = timeago1(event["begin"])
-        s2 = timeago1(event["end"])
+        s1 = fmt_timedelta(timeago(event["begin"]))
+        s2 = fmt_timedelta(timeago(event["end"]))
         if s1 == s2:
             return s1
         else:
             return '{} &ndash; {}'.format(s1, s2)
     else:
-        return timeago1(event["created_at"])
+        return fmt_timedelta(timeago(event["created_at"]))
 
 # -----------------------------------------------------------------------------
 # Parsing events
@@ -365,7 +396,7 @@ def parse(event):
     """Parse an event into a dictionary or None.
     
     If the event is one we are interested in, return a dictionary with
-    "icon", "body", "time" keys.
+    "icon", "body", "time" and "timeago" keys.
 
     If the event is one we are not interested in, return None.
     """
@@ -378,7 +409,7 @@ def parse(event):
 
     # append timestamp & time string
     d["time"] = event["created_at"]
-    d["timeago"] = timeago(event)
+    d["timeago"] = timeago_event(event)
 
     return d
 
