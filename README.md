@@ -20,6 +20,9 @@ $ flask run
  * Running on http://127.0.0.1:5000/ (Press CTRL+C to quit)
 ```
 
+The page will auto-refresh every 5 minutes, so it is suitable for
+displaying on a monitor without intervention.
+
 
 ## Authentication
 
