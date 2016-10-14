@@ -1,32 +1,32 @@
 ghdash
 ======
 
-Another simple github dashboard for teams. I don't know why.
+A very simple github newsfeed for teams.
 
-Requires [requests](http://docs.python-requests.org/) and
-[jinja2](jinja.pocoo.org/), and Python 2.7 or 3.3+.
+Requires [requests](http://docs.python-requests.org/),
+[jinja2](http://jinja.pocoo.org/),
+[flask](http://flask.pocoo.org) and Python 2.7 or 3.3+.
 
 ## Usage
 
 Add a file `users.txt` to this directory listing your team's github user names.
 
-Fetch new events from github (saved to `data` directory).
+Launch the flask app in development mode:
 
 ```
-ghdash.py fetch
+$ export FLASK_APP=ghdash.py
+$ flask run
+ * Serving Flask app "ghdash"
+ * Running on http://127.0.0.1:5000/ (Press CTRL+C to quit)
 ```
 
-Build a page with the events (written to a `output` directory).
-
-```
-ghdash.py build
-```
 
 ## Authentication
 
 GitHub limits the requests per hour allowed to their
 API. Unauthenticated requests are allowed only 60 requests per
-hour. To get 5000 requests per hour, add the line
+hour, which you will quickly reach.
+To get 5000 requests per hour, add the line
 
 ```
 machine api.github.com login GITHUB_USERNAME password GITHUB_PASSWORD
@@ -35,9 +35,19 @@ machine api.github.com login GITHUB_USERNAME password GITHUB_PASSWORD
 to your `~/.netrc` file. The requests library picks up these credentials
 automatically.
 
-You'll see the remaining requests per hour for each fetch:
+You'll see the remaining requests per hour for each fetch printed in the
+terminal:
 
 ```
-$ ghdash.py fetch
- INFO: kbarbary: 1 new event          [4996/5000] 
+INFO: kbarbary: 1 new event          [4996/5000] 
+```
+
+
+## Rate limiting
+
+The app respects GitHub's requested rate limits, so for frequent page
+refreshes, you'll see something like:
+
+```
+INFO: kbarbary: polled 24s ago. Next poll allowed in 36s. 
 ```

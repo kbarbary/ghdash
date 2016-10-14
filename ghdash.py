@@ -11,13 +11,13 @@ from datetime import datetime
 
 import requests
 from jinja2 import Template
+from flask import Flask
 
-from pprint import pprint  # development only
+app = Flask(__name__)
 
-TMPL_DIR = "tmpl"
-OUTPUT_DIR = "output"
 USERS_FILE = "users.txt"
-DATA_DIR = "data"
+TEMPLATE_DIR = "templates"  # HTML Jinja template
+DATA_DIR = "data"  # used for cacheing
 GH_USER_EVENTS_URL = "https://api.github.com/users/{}/events/public"
 
 
@@ -141,6 +141,7 @@ def fetch_user_events(user):
     remaining = r.headers['x-ratelimit-remaining']
     info("{:30s} [{:>4s}/{:>4s}]".format(msg, remaining, limit))
 
+    
 def read_user_events(user):
     """Read user events from json data already in the cache"""
 
@@ -159,6 +160,8 @@ def read_user_events(user):
 
 def is_merge_event(event):
     if event["type"] == "PushEvent":
+        if len(event["payload"]["commits"]) == 0:
+            return False
         lastmsg = event["payload"]["commits"][-1]["message"]
         if lastmsg.lower().startswith("merge pull request"):
             return True
@@ -414,17 +417,14 @@ def parse(event):
     return d
 
 
+# -----------------------------------------------------------------------------
+# Main bits
+
 def build_html(events):
-    """Render events"""
+    """Render contents of index.html page."""
 
     #sort events by time
     events.sort(key=lambda x: x["created_at"], reverse=True)
-
-    # Print all events, just for dev info.
-    #for event in events:
-    #    info(" ".join([event["created_at"],
-    #                   event["actor"]["login"],
-    #                   event["type"]]))
 
     # parse all events
     summaries = []
@@ -434,55 +434,24 @@ def build_html(events):
             summaries.append(s)
 
     # load template
-    with open(os.path.join(TMPL_DIR, "index.html")) as f:
+    with open(os.path.join(TEMPLATE_DIR, "index.html")) as f:
         template_html = f.read()
     template = Template(template_html)
 
-    # copy static files
-    for subdir in ["css", "style"]:
-        src = os.path.join(TMPL_DIR, subdir)
-        dst = os.path.join(OUTPUT_DIR, subdir)
-        if not os.path.exists(dst):
-            shutil.copytree(src, dst)
-
-    # render and ouput page.
-    page = template.render(events=summaries)
-    fname = os.path.join(OUTPUT_DIR, "index.html")
-    with open(fname, "w") as f:
-        f.write(page)
-    info("wrote " + fname)
+    return template.render(events=summaries)
 
 
-# -----------------------------------------------------------------------------
-# Main
-
-if __name__ == "__main__":
-    
-    usage = ("Usage: {} fetch\n"
-              "       {} build".format(__file__, __file__))
-
-    if len(sys.argv) != 2 or sys.argv[1] == "--help" or sys.argv[1] == "-h":
-        print(usage)
-        exit(1)
-
-    command = sys.argv[1]
-
+@app.route("/")
+def index():
     users = read_users(USERS_FILE)
+    for user in users:
+        fetch_user_events(user)
 
-    if command == "fetch":
-        for user in users:
-            fetch_user_events(user)
+    allevents = []
+    for user in users:
+        events = read_user_events(user)
+        events = filter_merges_in_user_events(events)
+        events = aggregate_pushes_in_user_events(events)
+        allevents.extend(events)
 
-    elif command == "build":
-        allevents = []
-        for user in users:
-            events = read_user_events(user)
-            events = filter_merges_in_user_events(events)
-            events = aggregate_pushes_in_user_events(events)
-            allevents.extend(events)
-
-        build_html(allevents)
-
-    else:
-        print(usage)
-        exit(1)
+    return build_html(allevents)
